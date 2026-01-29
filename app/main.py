@@ -1,14 +1,12 @@
 # main.py
-from fastapi import FastAPI, UploadFile, Form, File
+from fastapi import FastAPI, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from typing import Optional, List
-import asyncio
-import base64
-import json
 import subprocess
-
-import requests
+import json
+import asyncio
+import requests  # For HTTP API approach
 
 app = FastAPI()
 app.add_middleware(
@@ -19,23 +17,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration
-OLLAMA_USE_HTTP_API = True  # True = HTTP API, False = CLI
-OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL = "llama3:8b"
-OLLAMA_OPTIONS = {"temperature": 0.7, "top_p": 0.9, "num_predict": 2048}
+# Configuration - choose your preferred method
+OLLAMA_USE_HTTP_API = True  # Set to True to use HTTP API instead of CLI
+OLLAMA_BASE_URL = "http://localhost:11434"  # Default Ollama HTTP API URL
 
 def build_price_table(ohlc: List[dict], max_bars: int = 20) -> str:
+    """Create a short, human-friendly text table from OHLC list of dicts.
+    Expect each dict: {'t':'2025-08-26T12:00:00Z','open':..., 'high':..., 'low':..., 'close':..., 'volume':...}
+    """
     recent = ohlc[-max_bars:]
-    header = "time\topen\thigh\tlow\tclose\tvol"
-    rows = [
-        f"{r.get('t','?')}\t{r.get('open','?')}\t{r.get('high','?')}\t"
-        f"{r.get('low','?')}\t{r.get('close','?')}\t{r.get('volume','')}"
-        for r in recent
-    ]
-    return "\n".join([header, *rows])
+    rows = ["time\topen\thigh\tlow\tclose\tvol"]
+    for r in recent:
+        rows.append(f"{r.get('t','?')}\t{r.get('open','?')}\t{r.get('high','?')}\t{r.get('low','?')}\t{r.get('close','?')}\t{r.get('volume','')}")
+    return "\n".join(rows)
 
-def make_analysis_prompt(user_question: str, ohlc: Optional[List[dict]], image_b64: Optional[str]) -> str:
+def make_analysis_prompt(user_question: str, ohlc: Optional[List[dict]]) -> str:
     # Few-shot examples - keep these short and task-focused
     few_shot = """
 Example 1:
@@ -55,13 +51,11 @@ Interpretation: Expect a pullback, possible trend reversal; look for confirmatio
     ]
     if ohlc:
         prompt_parts += ["RECENT PRICE DATA (most recent last):", build_price_table(ohlc), ""]
-    if image_b64:
-        prompt_parts += ["CHART_IMAGE: (image included)","Please analyze the visible price action on the chart. Use the numeric data if present."]
 
     prompt_parts += ["", "FEW-SHOT EXAMPLES:", few_shot, "", "Answer:"]
     return "\n".join(prompt_parts)
 
-def call_ollama_http_api(prompt: str, image_b64: Optional[str] = None) -> str:
+def call_ollama_http_api(prompt: str) -> str:
     """Call Ollama using HTTP API instead of CLI"""
     try:
         payload = {
@@ -74,8 +68,6 @@ def call_ollama_http_api(prompt: str, image_b64: Optional[str] = None) -> str:
                 "num_predict": 2048
             }
         }
-        if image_b64:
-            payload["images"] = [image_b64]
         
         response = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=120)
         response.raise_for_status()
@@ -87,15 +79,13 @@ def call_ollama_http_api(prompt: str, image_b64: Optional[str] = None) -> str:
     except json.JSONDecodeError as e:
         raise Exception(f"Invalid JSON response from Ollama: {str(e)}")
 
-def call_ollama_cli(prompt: str, image_b64: Optional[str] = None) -> str:
+def call_ollama_cli(prompt: str) -> str:
     """Call Ollama using CLI subprocess"""
     try:
         payload = {
             "model": "llama3:8b",
             "prompt": prompt,
         }
-        if image_b64:
-            payload["images"] = [image_b64]
 
         # Call ollama via CLI; pass JSON on stdin and read stdout
         proc = subprocess.Popen(
@@ -115,18 +105,13 @@ def call_ollama_cli(prompt: str, image_b64: Optional[str] = None) -> str:
         raise Exception(f"Subprocess error: {str(e)}")
 
 @app.post("/chat")
-async def chat_endpoint(prompt: str = Form(...), image: UploadFile = File(None)):
+async def chat_endpoint(prompt: str = Form(...)):
     """Simple pass-through chat. Sends prompt and optional image to Gemma3 and returns the whole response."""
-    image_b64 = None
-    if image:
-        content = await image.read()
-        image_b64 = base64.b64encode(content).decode("utf-8")
-
     try:
         if OLLAMA_USE_HTTP_API:
-            response = call_ollama_http_api(prompt, image_b64)
+            response = call_ollama_http_api(prompt)
         else:
-            response = call_ollama_cli(prompt, image_b64)
+            response = call_ollama_cli(prompt)
         
         return {"response": response}
     except Exception as e:
@@ -136,18 +121,12 @@ async def chat_endpoint(prompt: str = Form(...), image: UploadFile = File(None))
 async def analyze_endpoint(
     question: str = Form(...),
     ohlc_json: Optional[str] = Form(None),  # JSON string of list of OHLC dicts
-    image: UploadFile = File(None),
     stream: Optional[bool] = Form(False),
 ):
     """Specialized price-action analysis endpoint.
        - 'ohlc_json' is optional stringified JSON of recent bars.
        - if stream=True, returns Server-Sent Events (SSE) streaming of tokens (if ollama CLI streams).
     """
-    image_b64 = None
-    if image:
-        content = await image.read()
-        image_b64 = base64.b64encode(content).decode("utf-8")
-
     ohlc = None
     if ohlc_json:
         try:
@@ -155,15 +134,15 @@ async def analyze_endpoint(
         except Exception as e:
             return JSONResponse({"error": "Invalid ohlc_json: " + str(e)}, status_code=400)
 
-    prompt = make_analysis_prompt(question, ohlc, image_b64)
+    prompt = make_analysis_prompt(question, ohlc)
 
     # Non-streaming version (simpler)
     if not stream:
         try:
             if OLLAMA_USE_HTTP_API:
-                analysis = call_ollama_http_api(prompt, image_b64)
+                analysis = call_ollama_http_api(prompt)
             else:
-                analysis = call_ollama_cli(prompt, image_b64)
+                analysis = call_ollama_cli(prompt)
             
             return {"analysis": analysis}
         except Exception as e:
@@ -184,8 +163,6 @@ async def analyze_endpoint(
                         "num_predict": 2048
                     }
                 }
-                if image_b64:
-                    payload["images"] = [image_b64]
                 
                 # Use aiohttp for async streaming or fallback to sync requests
                 try:
@@ -204,7 +181,7 @@ async def analyze_endpoint(
                                 continue
                 except Exception as e:
                     # Fallback to non-streaming if streaming fails
-                    response = call_ollama_http_api(prompt, image_b64)
+                    response = call_ollama_http_api(prompt)
                     yield response
             else:
                 proc = await asyncio.create_subprocess_exec(
